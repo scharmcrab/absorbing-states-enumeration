@@ -1,0 +1,489 @@
+%%writefile bssmd_full.cu
+/*
+ * bssmd_full.cu — Find all BSSMD fixed points (GPU) and classify up to
+ * isomorphism (CPU), all in one program.
+ *
+ * Outputs both the labeled count a(n) and unlabeled count b(n).
+ *
+ * Colab (GPU runtime):
+ *   Cell 1: %%writefile bssmd_full.cu
+ *           (paste this file)
+ *   Cell 2: !nvcc -O3 -o bssmd_full bssmd_full.cu
+ *   Cell 3: !./bssmd_full 2 6     # verify
+ *   Cell 4: !./bssmd_full 7       # the big one
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+typedef struct {
+    int trust_bit;
+    int ny;
+    int z_bits[6];
+    int a_bits[6];
+} PairCheck;
+
+/* ═══════════════════════════════════════════════════════════════
+ * GPU KERNELS
+ * ═══════════════════════════════════════════════════════════════ */
+
+__global__ void count_kernel(uint64_t offset, uint64_t chunk_size,
+                             PairCheck *pairs, int npairs,
+                             uint64_t *block_counts) {
+    uint64_t tid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+    if (tid >= chunk_size) return;
+    uint64_t s = offset + tid;
+
+    int is_fp = 1;
+    for (int p = 0; p < npairs && is_fp; p++) {
+        if (!((s >> pairs[p].trust_bit) & 1)) continue;
+        for (int yi = 0; yi < pairs[p].ny; yi++) {
+            if (((s >> pairs[p].z_bits[yi]) ^ (s >> pairs[p].a_bits[yi])) & 1) {
+                is_fp = 0; break;
+            }
+        }
+    }
+
+    unsigned mask = __activemask();
+    unsigned ballot = __ballot_sync(mask, is_fp);
+    if ((threadIdx.x & 31) == 0)
+        atomicAdd((unsigned long long *)&block_counts[blockIdx.x],
+                  (unsigned long long)__popc(ballot));
+}
+
+__global__ void collect_kernel(uint64_t offset, uint64_t chunk_size,
+                               PairCheck *pairs, int npairs,
+                               uint64_t *out_states, uint64_t *out_counter) {
+    uint64_t tid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+    if (tid >= chunk_size) return;
+    uint64_t s = offset + tid;
+
+    int is_fp = 1;
+    for (int p = 0; p < npairs && is_fp; p++) {
+        if (!((s >> pairs[p].trust_bit) & 1)) continue;
+        for (int yi = 0; yi < pairs[p].ny; yi++) {
+            if (((s >> pairs[p].z_bits[yi]) ^ (s >> pairs[p].a_bits[yi])) & 1) {
+                is_fp = 0; break;
+            }
+        }
+    }
+
+    if (is_fp) {
+        uint64_t idx = atomicAdd((unsigned long long *)out_counter, 1ULL);
+        out_states[idx] = s;
+    }
+}
+
+__global__ void reduce_kernel(uint64_t *block_counts, uint64_t *result,
+                              uint64_t nblocks) {
+    uint64_t sum = 0;
+    for (uint64_t i = threadIdx.x; i < nblocks; i += blockDim.x)
+        sum += block_counts[i];
+
+    __shared__ uint64_t shared[256];
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+        atomicAdd((unsigned long long *)result, (unsigned long long)shared[0]);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * CPU: PERMUTATION GENERATION
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int g_nperms;
+static int g_perms[5040][8];  /* max n=7: 7! = 5040 */
+
+static void gen_perms_helper(int n, int *perm, int *used, int depth) {
+    if (depth == n) {
+        memcpy(g_perms[g_nperms++], perm, n * sizeof(int));
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        if (!used[i]) {
+            used[i] = 1;
+            perm[depth] = i;
+            gen_perms_helper(n, perm, used, depth + 1);
+            used[i] = 0;
+        }
+    }
+}
+
+static void gen_perms(int n) {
+    int perm[8] = {0}, used[8] = {0};
+    g_nperms = 0;
+    gen_perms_helper(n, perm, used, 0);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * CPU: CANONICAL FORM via permutation
+ *
+ * State integer encodes adjacency matrix. Bit positions are:
+ *   positions = [(i,j) for i in range(n) for j in range(n) if i!=j]
+ *   MSB = first position.
+ *
+ * Applying permutation sigma: new[sigma[i]][sigma[j]] = old[i][j]
+ * We precompute a bit remapping table for each permutation.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* For each permutation p, remap[p][k] says: bit k of old state maps to
+ * bit remap[p][k] of new state. */
+static int g_remap[5040][42];  /* max d = 7*6 = 42 */
+
+static void precompute_remaps(int n) {
+    int d = n * (n - 1);
+
+    /* Build position list */
+    int pos_i[42], pos_j[42];
+    int idx = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            if (i != j) { pos_i[idx] = i; pos_j[idx] = j; idx++; }
+
+    /* For each permutation, compute the bit remapping */
+    for (int p = 0; p < g_nperms; p++) {
+        int *sigma = g_perms[p];
+        for (int k = 0; k < d; k++) {
+            /* Bit k corresponds to edge (pos_i[k], pos_j[k]).
+             * Under sigma, this maps to edge (sigma[pos_i[k]], sigma[pos_j[k]]).
+             * Find which bit position that is. */
+            int ni = sigma[pos_i[k]];
+            int nj = sigma[pos_j[k]];
+            /* Position of (ni, nj) in the list: ni*(n-1) + (nj > ni ? nj-1 : nj) */
+            int new_k = ni * (n - 1) + (nj > ni ? nj - 1 : nj);
+            g_remap[p][k] = new_k;
+        }
+    }
+}
+
+static uint64_t apply_perm(uint64_t s, int perm_idx, int d) {
+    int *remap = g_remap[perm_idx];
+    uint64_t result = 0;
+    for (int k = 0; k < d; k++) {
+        if ((s >> (d - 1 - k)) & 1)
+            result |= (1ULL << (d - 1 - remap[k]));
+    }
+    return result;
+}
+
+static uint64_t canonical_form(uint64_t s, int d) {
+    uint64_t best = s;
+    for (int p = 0; p < g_nperms; p++) {
+        uint64_t ps = apply_perm(s, p, d);
+        if (ps < best) best = ps;
+    }
+    return best;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * CPU: CLASSIFY — count distinct canonical forms
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int compare_u64(const void *a, const void *b) {
+    uint64_t va = *(const uint64_t *)a;
+    uint64_t vb = *(const uint64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+static uint64_t classify(uint64_t *states, uint64_t count, int n) {
+    int d = n * (n - 1);
+
+    fprintf(stderr, "Classifying %llu fixed points under S_%d (%d permutations)...\n",
+            (unsigned long long)count, n, g_nperms);
+
+    /* Compute canonical form for each state */
+    uint64_t *canons = (uint64_t *)malloc(count * sizeof(uint64_t));
+
+    for (uint64_t i = 0; i < count; i++) {
+        canons[i] = canonical_form(states[i], d);
+        if ((i + 1) % 5000 == 0)
+            fprintf(stderr, "\r  Canonicalizing: %llu / %llu   ",
+                    (unsigned long long)(i + 1), (unsigned long long)count);
+    }
+    if (count >= 5000)
+        fprintf(stderr, "\r%60s\r", "");
+
+    /* Sort and count unique */
+    qsort(canons, count, sizeof(uint64_t), compare_u64);
+
+    uint64_t n_classes = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        if (i == 0 || canons[i] != canons[i - 1])
+            n_classes++;
+    }
+
+    /* Print orbit size distribution */
+    fprintf(stderr, "  %llu isomorphism classes\n", (unsigned long long)n_classes);
+    fprintf(stderr, "  Orbit sizes: ");
+    uint64_t run = 1;
+    for (uint64_t i = 1; i <= count; i++) {
+        if (i < count && canons[i] == canons[i - 1]) {
+            run++;
+        } else {
+            fprintf(stderr, "%llu", (unsigned long long)run);
+            if (i < count) fprintf(stderr, ", ");
+            run = 1;
+        }
+    }
+    fprintf(stderr, "\n");
+
+    free(canons);
+    return n_classes;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * CPU FALLBACK for small n
+ * ═══════════════════════════════════════════════════════════════ */
+
+static uint64_t cpu_find_and_classify(int n) {
+    int d = n * (n - 1);
+    uint64_t total = 1ULL << d;
+
+    int edge_bit[8][8];
+    int k = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            if (i != j) edge_bit[i][j] = d - 1 - k++;
+
+    int npairs = 0;
+    PairCheck pairs[56];
+    for (int z = 0; z < n; z++)
+        for (int a = 0; a < n; a++) {
+            if (a == z) continue;
+            PairCheck *p = &pairs[npairs++];
+            p->trust_bit = edge_bit[z][a];
+            p->ny = 0;
+            for (int y = 0; y < n; y++) {
+                if (y == z || y == a) continue;
+                p->z_bits[p->ny] = edge_bit[z][y];
+                p->a_bits[p->ny] = edge_bit[a][y];
+                p->ny++;
+            }
+        }
+
+    /* Find fixed points */
+    uint64_t *fps = (uint64_t *)malloc(total * sizeof(uint64_t));
+    uint64_t fp_count = 0;
+    for (uint64_t s = 0; s < total; s++) {
+        int is_fp = 1;
+        for (int p = 0; p < npairs && is_fp; p++) {
+            if (!((s >> pairs[p].trust_bit) & 1)) continue;
+            for (int yi = 0; yi < pairs[p].ny; yi++) {
+                if (((s >> pairs[p].z_bits[yi]) ^ (s >> pairs[p].a_bits[yi])) & 1) {
+                    is_fp = 0; break;
+                }
+            }
+        }
+        if (is_fp) fps[fp_count++] = s;
+    }
+
+    printf("  a(%d) = %llu (labeled)\n", n, (unsigned long long)fp_count);
+
+    /* Classify */
+    uint64_t n_classes;
+    if (fp_count > 0)
+        n_classes = classify(fps, fp_count, n);
+    else
+        n_classes = 0;
+
+    printf("  b(%d) = %llu (unlabeled)\n", n, (unsigned long long)n_classes);
+
+    free(fps);
+    return n_classes;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * GPU path
+ * ═══════════════════════════════════════════════════════════════ */
+
+static void gpu_find_and_classify(int n) {
+    int d = n * (n - 1);
+    uint64_t total = 1ULL << d;
+
+    int edge_bit[8][8];
+    int k = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            if (i != j) edge_bit[i][j] = d - 1 - k++;
+
+    int npairs = 0;
+    PairCheck h_pairs[56];
+    for (int z = 0; z < n; z++)
+        for (int a = 0; a < n; a++) {
+            if (a == z) continue;
+            PairCheck *p = &h_pairs[npairs++];
+            p->trust_bit = edge_bit[z][a];
+            p->ny = 0;
+            for (int y = 0; y < n; y++) {
+                if (y == z || y == a) continue;
+                p->z_bits[p->ny] = edge_bit[z][y];
+                p->a_bits[p->ny] = edge_bit[a][y];
+                p->ny++;
+            }
+        }
+
+    PairCheck *d_pairs;
+    cudaMalloc(&d_pairs, npairs * sizeof(PairCheck));
+    cudaMemcpy(d_pairs, h_pairs, npairs * sizeof(PairCheck), cudaMemcpyHostToDevice);
+
+    int tpb = 256;
+    uint64_t max_chunk = 1ULL << 28;
+    if (max_chunk > total) max_chunk = total;
+
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+    /* Pass 1: Count */
+    fprintf(stderr, "  GPU pass 1: counting...\n");
+    uint64_t fp_count = 0;
+    for (uint64_t offset = 0; offset < total; offset += max_chunk) {
+        uint64_t chunk = (offset + max_chunk > total) ? total - offset : max_chunk;
+        uint64_t nblocks = (chunk + tpb - 1) / tpb;
+
+        uint64_t *d_bc, *d_res;
+        cudaMalloc(&d_bc, nblocks * sizeof(uint64_t));
+        cudaMemset(d_bc, 0, nblocks * sizeof(uint64_t));
+        cudaMalloc(&d_res, sizeof(uint64_t));
+        cudaMemset(d_res, 0, sizeof(uint64_t));
+
+        count_kernel<<<nblocks, tpb>>>(offset, chunk, d_pairs, npairs, d_bc);
+        reduce_kernel<<<1, 256>>>(d_bc, d_res, nblocks);
+
+        uint64_t cc;
+        cudaMemcpy(&cc, d_res, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        fp_count += cc;
+        cudaFree(d_bc); cudaFree(d_res);
+
+        fprintf(stderr, "\r    %.1f%%   ", 100.0 * (offset + chunk) / total);
+    }
+    fprintf(stderr, "\r    Count: %llu fixed points      \n",
+            (unsigned long long)fp_count);
+
+    printf("  a(%d) = %llu (labeled)\n", n, (unsigned long long)fp_count);
+
+    if (fp_count == 0) {
+        printf("  b(%d) = 0 (unlabeled)\n", n);
+        cudaFree(d_pairs);
+        return;
+    }
+
+    /* Pass 2: Collect */
+    fprintf(stderr, "  GPU pass 2: collecting...\n");
+    uint64_t *d_states, *d_counter;
+    cudaMalloc(&d_states, fp_count * sizeof(uint64_t));
+    cudaMalloc(&d_counter, sizeof(uint64_t));
+    cudaMemset(d_counter, 0, sizeof(uint64_t));
+
+    for (uint64_t offset = 0; offset < total; offset += max_chunk) {
+        uint64_t chunk = (offset + max_chunk > total) ? total - offset : max_chunk;
+        uint64_t nblocks = (chunk + tpb - 1) / tpb;
+
+        collect_kernel<<<nblocks, tpb>>>(offset, chunk, d_pairs, npairs,
+                                         d_states, d_counter);
+        cudaDeviceSynchronize();
+        fprintf(stderr, "\r    %.1f%%   ", 100.0 * (offset + chunk) / total);
+    }
+    fprintf(stderr, "\r    Collected          \n");
+
+    uint64_t *h_states = (uint64_t *)malloc(fp_count * sizeof(uint64_t));
+    cudaMemcpy(h_states, d_states, fp_count * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double gpu_time = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
+    fprintf(stderr, "  GPU time: %.1fs\n", gpu_time);
+
+    /* CPU classification */
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    uint64_t n_classes = classify(h_states, fp_count, n);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double cpu_time = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
+
+    printf("  b(%d) = %llu (unlabeled)\n", n, (unsigned long long)n_classes);
+    fprintf(stderr, "  Classification time: %.1fs\n", cpu_time);
+
+    free(h_states);
+    cudaFree(d_states); cudaFree(d_counter); cudaFree(d_pairs);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * MAIN
+ * ═══════════════════════════════════════════════════════════════ */
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr,
+            "Usage: %s <n> [n_max]\n\n"
+            "Computes labeled (a) and unlabeled (b) BSSMD fixed point counts.\n"
+            "Known:\n"
+            "  a: 1, 4, 17, 89, 552, 3895, 30641\n"
+            "  b: 1, 3, 6, 13, 24, 48, ?\n\n"
+            "Examples:\n"
+            "  %s 2 6    verify known values\n"
+            "  %s 7      compute both a(7) and b(7)\n",
+            argv[0], argv[0], argv[0]);
+        return 1;
+    }
+
+    int n_start = atoi(argv[1]);
+    int n_end = argc > 2 ? atoi(argv[2]) : n_start;
+
+    if (n_start < 1 || n_end > 8) {
+        fprintf(stderr, "n must be between 1 and 8\n");
+        return 1;
+    }
+
+    int device_count = 0;
+    cudaGetDeviceCount(&device_count);
+    if (device_count > 0) {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, 0);
+        fprintf(stderr, "GPU: %s\n\n", prop.name);
+    } else {
+        fprintf(stderr, "No GPU found, using CPU for all n\n\n");
+    }
+
+    uint64_t a_vals[9] = {0}, b_vals[9] = {0};
+    int computed[9] = {0};
+
+    for (int n = n_start; n <= n_end; n++) {
+        int d = n * (n - 1);
+        uint64_t total = 1ULL << d;
+
+        printf("n=%d: d=%d, 2^%d = %llu states\n",
+               n, d, d, (unsigned long long)total);
+
+        if (d > 48) {
+            printf("  Skipping — too large\n\n");
+            continue;
+        }
+
+        /* Precompute permutations and bit remappings */
+        gen_perms(n);
+        precompute_remaps(n);
+
+        if (device_count > 0 && total > 100000)
+            gpu_find_and_classify(n);
+        else
+            cpu_find_and_classify(n);
+
+        printf("\n");
+        fflush(stdout);
+    }
+
+    return 0;
+}
+
+
+!nvcc -O3 -o bssmd_full bssmd_full.cu
+
+!./bssmd_full 7
